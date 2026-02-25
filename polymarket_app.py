@@ -48,8 +48,38 @@ st.markdown("""
 /* Divider */
 hr { border-color: #21262d !important; }
 
-/* Number input: keep typed text black on white background */
-[data-testid="stSidebar"] input[type="number"] { color: #000000 !important; }
+/* ── All input/select elements: dark text on light widget background ── */
+input, textarea, select,
+input[type="text"],
+input[type="number"],
+input[type="search"],
+input[type="email"],
+.stTextInput input,
+.stNumberInput input,
+.stSelectbox select,
+[data-baseweb="input"] input,
+[data-baseweb="select"] input,
+[data-baseweb="textarea"] textarea {
+    color: #111111 !important;
+    background-color: #ffffff !important;
+}
+
+/* Selectbox dropdown option text */
+[data-baseweb="select"] [data-testid="stSelectboxVirtualDropdown"],
+[data-baseweb="popover"] li,
+[data-baseweb="menu"] li {
+    color: #111111 !important;
+    background-color: #ffffff !important;
+}
+
+/* Placeholder text */
+input::placeholder,
+textarea::placeholder { color: #888888 !important; }
+
+/* Widget labels (text_input, number_input, selectbox labels above the box) */
+.stTextInput label,
+.stNumberInput label,
+.stSelectbox label { color: #cccccc !important; }
 
 /* Dataframe */
 [data-testid="stDataFrame"] { border: 1px solid #30363d; border-radius: 8px; }
@@ -69,11 +99,11 @@ reinvest      = st.sidebar.toggle("Reinvest Gains", value=True,
                                    help="ON: bet grows with capital (compounding).  OFF: bet stays fixed to starting capital.")
 
 st.sidebar.divider()
-spread        = st.sidebar.slider("Spread",                  0.5,  5.0,  2.0, 0.5, format="%.1f%%") / 100
-reversal_prob = st.sidebar.slider("Reversal Probability",    0,    50,   10,  5,   format="%d%%")   / 100
-illiquid_prob     = st.sidebar.slider("Illiquidity Probability", 0,   50,  5,   5, format="%d%%") / 100
-illiquid_discount = st.sidebar.slider("Illiquidity Discount",    0,  100, 72,  1,
-                                       format="%d%%",
+spread        = st.sidebar.slider("Spread",                  0.5,  5.0,  2.0, 0.5, format="%.1f%%", key="slider_spread") / 100
+reversal_prob = st.sidebar.slider("Reversal Probability",    0,    50,   10,  5,   format="%d%%",   key="slider_reversal") / 100
+illiquid_prob     = st.sidebar.slider("Illiquidity Probability", 0,  50,  5,  5, format="%d%%", key="slider_illiquid_prob") / 100
+illiquid_discount = st.sidebar.slider("Illiquidity Discount",    0, 100, 72,  1,
+                                       format="%d%%", key="slider_illiquid_discount",
                                        help="How much of the loser's value is lost when selling in illiquid conditions.") / 100
 n_bets            = st.sidebar.slider("Number of Bets",         10, 500, 100, 10)
 
@@ -340,3 +370,247 @@ except requests.exceptions.HTTPError as e:
     st.error(f"API returned an error: {e}")
 except Exception as e:
     st.error(f"Unexpected error fetching market data: {e}")
+
+# ── My Real Trades ──────────────────────────────────────────────────────────────
+st.divider()
+st.header("My Real Trades")
+
+wallet_col, btn_col = st.columns([4, 1])
+wallet = wallet_col.text_input("Wallet address", placeholder="0x...",
+                                label_visibility="collapsed", key="wallet_input")
+
+if btn_col.button("Load My Trades", use_container_width=True):
+    if not wallet or not wallet.startswith("0x"):
+        st.warning("Please enter a valid 0x wallet address.")
+    else:
+        try:
+            resp = requests.get(
+                "https://data-api.polymarket.com/activity",
+                params={"user": wallet},
+                timeout=15,
+            )
+            resp.raise_for_status()
+            st.session_state["trades_raw"] = resp.json()
+        except requests.exceptions.ConnectionError:
+            st.error("Could not connect to Polymarket Data API.")
+        except requests.exceptions.Timeout:
+            st.error("Request timed out.")
+        except requests.exceptions.HTTPError as e:
+            st.error(f"API error: {e}")
+        except Exception as e:
+            st.error(f"Unexpected error: {e}")
+
+if "trades_raw" in st.session_state:
+    from datetime import datetime, timezone as _tz
+
+    data = st.session_state["trades_raw"]
+    trades_list = data if isinstance(data, list) else data.get("data", data.get("activity", []))
+
+    if not trades_list:
+        st.info("No trade activity found for this wallet.")
+    else:
+        # ── Debug: show raw field names + sample values ─────────────────────
+        with st.expander("Debug: raw API fields (first 3 records)", expanded=False):
+            all_keys = sorted({k for t in trades_list for k in t.keys()})
+            st.write("**All field names:**", all_keys)
+            for i, t in enumerate(trades_list[:3]):
+                st.write(f"**Record {i+1}:**",
+                         {k: v for k, v in t.items()
+                          if k in ("side", "type", "tradeType", "outcome", "outcomeIndex",
+                                   "asset", "price", "avgPrice", "size", "shares",
+                                   "usdcSize", "amount", "cashAmount", "cashPnl",
+                                   "value", "cost", "notional", "proxyWallet",
+                                   "title", "question", "market", "name",
+                                   "timestamp", "createdAt", "date")})
+
+        # ── Parse into clean rows ───────────────────────────────────────────
+        rows = []
+        for t in trades_list:
+            # Date
+            ts = t.get("timestamp") or t.get("createdAt") or t.get("date") or ""
+            try:
+                if isinstance(ts, (int, float)):
+                    date_str = datetime.fromtimestamp(float(ts), tz=_tz.utc).strftime("%Y-%m-%d")
+                else:
+                    date_str = str(ts)[:10]
+            except Exception:
+                date_str = str(ts)[:10] if ts else "N/A"
+
+            # Market question
+            question = (t.get("title") or t.get("question") or t.get("market")
+                        or t.get("marketQuestion") or t.get("name") or "Unknown")
+            question = str(question)
+            if len(question) > 72:
+                question = question[:71] + "…"
+
+            # Side
+            side_raw = str(t.get("side") or t.get("type") or t.get("tradeType") or "").upper()
+            side = "Buy" if "BUY" in side_raw else ("Sell" if "SELL" in side_raw else side_raw.title())
+
+            # Outcome / which token — normalise to Up/Down
+            outcome = str(t.get("outcome") or "")
+            if not outcome or outcome == "None":
+                idx = t.get("outcomeIndex")
+                outcome = "Up" if idx == 0 else ("Down" if idx == 1 else str(idx or ""))
+            # Legacy YES/NO → Up/Down
+            if outcome in ("YES", "0"): outcome = "Up"
+            if outcome in ("NO",  "1"): outcome = "Down"
+
+            # Price, shares, total USDC — use explicit None checks so 0.0 isn't skipped
+            def _first(*keys):
+                for k in keys:
+                    v = t.get(k)
+                    if v is not None:
+                        return v
+                return None
+
+            price  = _first("price", "avgPrice", "executedPrice")
+            shares = _first("size", "shares", "quantity")
+            usdc   = _first("usdcSize", "amount", "cashAmount", "value",
+                            "cost", "notional", "cashPnl")
+
+            try:
+                price  = float(price)  if price  is not None else float("nan")
+                shares = float(shares) if shares is not None else float("nan")
+                usdc   = float(usdc)   if usdc   is not None else (
+                             price * shares if not (np.isnan(price) or np.isnan(shares)) else float("nan"))
+            except (TypeError, ValueError):
+                price = shares = usdc = float("nan")
+
+            rows.append({
+                "Date":        date_str,
+                "Market":      question,
+                "Token":       outcome,
+                "Action":      side,
+                "Price/share": price,
+                "Shares":      shares,
+                "Total ($)":   usdc,
+            })
+
+        df_trades = pd.DataFrame(rows)
+
+        # ── Exclude Redeem actions ──────────────────────────────────────────
+        df_trades = df_trades[
+            ~df_trades["Action"].str.upper().str.contains("REDEEM", na=False)
+        ]
+
+        # ── Dual-side filter: keep markets where both YES and NO were bought ──
+        buy_df = df_trades[df_trades["Action"] == "Buy"]
+        tokens_per_market = buy_df.groupby("Market")["Token"].apply(set)
+        dual_markets = tokens_per_market[tokens_per_market.apply(
+            lambda s: ("Up" in s and "Down" in s) or ("YES" in s and "NO" in s) or len(s) >= 2
+        )].index
+        df_dual = df_trades[df_trades["Market"].isin(dual_markets)]
+
+        if df_dual.empty:
+            st.info("No dual-side (YES + NO) markets found. "
+                    "Only markets where both sides were bought are shown here.")
+        else:
+            # ── Group by market → one row per bet ───────────────────────────
+            market_rows = []
+            for market, grp in df_dual.groupby("Market"):
+                inv_up   = grp[(grp["Action"] == "Buy")  & (grp["Token"] == "Up")  ]["Total ($)"].dropna().sum()
+                inv_dn   = grp[(grp["Action"] == "Buy")  & (grp["Token"] == "Down")]["Total ($)"].dropna().sum()
+                rec_up   = grp[(grp["Action"] == "Sell") & (grp["Token"] == "Up")  ]["Total ($)"].dropna().sum()
+                rec_dn   = grp[(grp["Action"] == "Sell") & (grp["Token"] == "Down")]["Total ($)"].dropna().sum()
+                tot_inv  = inv_up + inv_dn
+                tot_rec  = rec_up + rec_dn
+                pnl      = tot_rec - tot_inv
+                pnl_pct  = pnl / tot_inv * 100 if tot_inv > 0 else float("nan")
+                market_rows.append({
+                    "Market":               market,
+                    "Invested Up ($)":      inv_up,
+                    "Invested Down ($)":    inv_dn,
+                    "Total Invested ($)":   tot_inv,
+                    "Recovered Up ($)":     rec_up,
+                    "Recovered Down ($)":   rec_dn,
+                    "Total Recovered ($)":  tot_rec,
+                    "P&L ($)":              pnl,
+                    "P&L (%)":              pnl_pct,
+                })
+
+            df_grouped = pd.DataFrame(market_rows).reset_index(drop=True)
+
+            # ── Append bold summary row ──────────────────────────────────────
+            tot_inv_sum = df_grouped["Total Invested ($)"].sum()
+            summary = {
+                "Market":              "TOTAL",
+                "Invested Up ($)":     df_grouped["Invested Up ($)"].sum(),
+                "Invested Down ($)":   df_grouped["Invested Down ($)"].sum(),
+                "Total Invested ($)":  tot_inv_sum,
+                "Recovered Up ($)":    df_grouped["Recovered Up ($)"].sum(),
+                "Recovered Down ($)":  df_grouped["Recovered Down ($)"].sum(),
+                "Total Recovered ($)": df_grouped["Total Recovered ($)"].sum(),
+                "P&L ($)":             df_grouped["P&L ($)"].sum(),
+                "P&L (%)":             df_grouped["P&L ($)"].sum() / tot_inv_sum * 100
+                                       if tot_inv_sum > 0 else float("nan"),
+            }
+            summary_idx = len(df_grouped)
+            df_display = pd.concat([df_grouped, pd.DataFrame([summary])],
+                                   ignore_index=True)
+
+            # ── Styling ──────────────────────────────────────────────────────
+            def style_table(row):
+                styles = [""] * len(row)
+                cols   = list(row.index)
+                if row.name == summary_idx:
+                    return ["background-color: #1c2233; font-weight: bold; "
+                            "color: #ffffff"] * len(row)
+                pnl = row["P&L ($)"]
+                if pd.notna(pnl) and pnl > 0:
+                    cell = "background-color: #0d2a1a; color: #3fb950; font-weight: 600"
+                elif pd.notna(pnl) and pnl < 0:
+                    cell = "background-color: #2a0d0d; color: #f85149; font-weight: 600"
+                else:
+                    cell = ""
+                for i, col in enumerate(cols):
+                    if col in ("P&L ($)", "P&L (%)"):
+                        styles[i] = cell
+                return styles
+
+            def _d(v):
+                try: return f"${v:,.2f}"
+                except: return str(v)
+
+            def _pnl(v):
+                try: return f"+${v:,.2f}" if v >= 0 else f"-${abs(v):,.2f}"
+                except: return str(v)
+
+            def _pct(v):
+                try: return f"+{v:.1f}%" if v >= 0 else f"{v:.1f}%"
+                except: return str(v)
+
+            styled = (
+                df_display.style
+                .apply(style_table, axis=1)
+                .format({
+                    "Invested Up ($)":     _d,
+                    "Invested Down ($)":   _d,
+                    "Total Invested ($)":  _d,
+                    "Recovered Up ($)":    _d,
+                    "Recovered Down ($)":  _d,
+                    "Total Recovered ($)": _d,
+                    "P&L ($)":             _pnl,
+                    "P&L (%)":             _pct,
+                }, na_rep="N/A")
+            )
+            st.dataframe(styled, use_container_width=True, hide_index=True)
+
+            # ── Summary metric cards ─────────────────────────────────────────
+            total_pnl       = df_grouped["P&L ($)"].sum()
+            wins            = int((df_grouped["P&L ($)"] > 0).sum())
+            total_bets      = len(df_grouped)
+            win_rate        = wins / total_bets * 100 if total_bets > 0 else float("nan")
+            pnl_pct_overall = total_pnl / tot_inv_sum * 100 if tot_inv_sum > 0 else float("nan")
+
+            st.markdown("---")
+            s1, s2, s3, s4 = st.columns(4)
+            s1.metric("Total Bets",     f"{total_bets}",
+                      f"{wins} wins · {total_bets - wins} losses")
+            s2.metric("Total Invested", f"${tot_inv_sum:,.2f}")
+            s3.metric("Win Rate",
+                      f"{win_rate:.0f}%" if not np.isnan(win_rate) else "N/A",
+                      f"{wins} of {total_bets}")
+            pnl_str = f"+${total_pnl:.2f}" if total_pnl >= 0 else f"-${abs(total_pnl):.2f}"
+            s4.metric("Total P&L", pnl_str,
+                      f"{pnl_pct_overall:+.1f}%" if not np.isnan(pnl_pct_overall) else "")
