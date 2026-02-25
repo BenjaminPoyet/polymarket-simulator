@@ -10,14 +10,18 @@ st.set_page_config(page_title="Polymarket Simulator", layout="wide")
 # ── Theme ───────────────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
-/* Main background */
-.stApp { background-color: #0e1117; }
+/* Main background + global text */
+.stApp { background-color: #0e1117; color: #ffffff; }
+.stApp p, .stApp span, .stApp div, .stApp li,
+.stApp h1, .stApp h2, .stApp h3, .stApp h4 { color: #ffffff; }
 
 /* Sidebar */
 [data-testid="stSidebar"] {
     background-color: #0d1117;
     border-right: 1px solid #21262d;
+    color: #ffffff;
 }
+[data-testid="stSidebar"] * { color: #ffffff; }
 
 /* Metric cards */
 [data-testid="metric-container"] {
@@ -27,13 +31,13 @@ st.markdown("""
     padding: 18px 20px;
 }
 [data-testid="metric-container"] label {
-    color: #8b949e !important;
+    color: #cccccc !important;
     font-size: 0.78rem;
     text-transform: uppercase;
     letter-spacing: 0.05em;
 }
 [data-testid="metric-container"] [data-testid="stMetricValue"] {
-    color: #e6edf3 !important;
+    color: #ffffff !important;
     font-size: 1.5rem;
     font-weight: 600;
 }
@@ -44,6 +48,9 @@ st.markdown("""
 /* Divider */
 hr { border-color: #21262d !important; }
 
+/* Number input: keep typed text black on white background */
+[data-testid="stSidebar"] input[type="number"] { color: #000000 !important; }
+
 /* Dataframe */
 [data-testid="stDataFrame"] { border: 1px solid #30363d; border-radius: 8px; }
 </style>
@@ -53,17 +60,27 @@ st.title("Polymarket Dual-Side Strategy Simulator")
 
 # ── Sliders (sidebar) ──────────────────────────────────────────────────────────
 st.sidebar.header("Strategy Parameters")
+
+CAPITAL_0    = st.sidebar.number_input("Starting Capital ($)", min_value=10.0,
+                                        max_value=100_000.0, value=50.0, step=10.0)
+BET_FRACTION = st.sidebar.slider("Bet Size (% of capital)", 10, 50, 12,
+                                  format="%d%%") / 100
+reinvest      = st.sidebar.toggle("Reinvest Gains", value=True,
+                                   help="ON: bet grows with capital (compounding).  OFF: bet stays fixed to starting capital.")
+
+st.sidebar.divider()
 spread        = st.sidebar.slider("Spread",                  0.5,  5.0,  2.0, 0.5, format="%.1f%%") / 100
 reversal_prob = st.sidebar.slider("Reversal Probability",    0,    50,   10,  5,   format="%d%%")   / 100
-illiquid_prob = st.sidebar.slider("Illiquidity Probability", 0,    50,   5,   5,   format="%d%%")   / 100
-n_bets        = st.sidebar.slider("Number of Bets",          10,   500,  100, 10)
+illiquid_prob     = st.sidebar.slider("Illiquidity Probability", 0,   50,  5,   5, format="%d%%") / 100
+illiquid_discount = st.sidebar.slider("Illiquidity Discount",    0,  100, 72,  1,
+                                       format="%d%%",
+                                       help="How much of the loser's value is lost when selling in illiquid conditions.") / 100
+n_bets            = st.sidebar.slider("Number of Bets",         10, 500, 100, 10)
 
 # ── Constants ──────────────────────────────────────────────────────────────────
-CAPITAL_0    = 50.0
-BET_FRACTION = 0.12
-THRESHOLD    = 0.75
-ENTRY_PRICE  = 0.50
-N_SIMS       = 300
+THRESHOLD   = 0.75
+ENTRY_PRICE = 0.50
+N_SIMS      = 300
 
 # ── Simulation ─────────────────────────────────────────────────────────────────
 # Strategy mechanics:
@@ -86,14 +103,15 @@ def simulate(seed):
             history[t + 1:] = capital
             break
 
-        bet   = capital * BET_FRACTION
+        bet   = capital * BET_FRACTION if reinvest else CAPITAL_0 * BET_FRACTION
         n_yes = (bet / 2) / yes_ask
         n_no  = (bet / 2) / no_ask
 
         reversal = rng.random() < reversal_prob
         illiquid = rng.random() < illiquid_prob
 
-        loser_recovery = 0.0 if illiquid else n_no * (1.0 - THRESHOLD)
+        loser_recovery = (n_no * (1.0 - THRESHOLD) * (1.0 - illiquid_discount)
+                          if illiquid else n_no * (1.0 - THRESHOLD))
         winner_payout  = 0.0 if reversal  else n_yes * 1.0
 
         capital = max(0.0, capital + loser_recovery + winner_payout - bet)
@@ -161,10 +179,11 @@ med_dd = float(np.median(np.max(dds, axis=1)) * 100)
 # Analytical expected value per $1 bet
 n_yes_1 = 0.5 / yes_ask
 n_no_1  = 0.5 / no_ask
+illiq_rec   = (1.0 - THRESHOLD) * (1.0 - illiquid_discount)
 ev_success  = n_no_1 * (1 - THRESHOLD) + n_yes_1 * 1.0 - 1.0
 ev_reversal = n_no_1 * (1 - THRESHOLD) + 0.0           - 1.0
-ev_illiquid = 0.0                        + n_yes_1 * 1.0 - 1.0
-ev_both_bad = 0.0                        + 0.0           - 1.0
+ev_illiquid = n_no_1 * illiq_rec        + n_yes_1 * 1.0 - 1.0
+ev_both_bad = n_no_1 * illiq_rec        + 0.0           - 1.0
 
 p_normal    = (1 - reversal_prob) * (1 - illiquid_prob)
 p_reversal  = reversal_prob       * (1 - illiquid_prob)
@@ -178,11 +197,30 @@ m1.metric("Median Final",    f"${median_final:.2f}",
           f"{(median_final / CAPITAL_0 - 1) * 100:+.1f}%")
 m2.metric("Win Rate",        f"{win_rate:.0f}%")
 m3.metric("Median Drawdown", f"{med_dd:.1f}%")
-m4.metric("Ruin Risk (<$5)", f"{ruin_rate:.1f}%")
+m4.metric(f"Ruin Risk (<${CAPITAL_0 * 0.10:.0f})", f"{ruin_rate:.1f}%")
 m5.metric("EV per Bet",      f"${ev_per_unit * BET_FRACTION * CAPITAL_0:+.3f}",
           f"({ev_per_unit * 100:+.2f}% per $1)")
 
 st.pyplot(fig, use_container_width=True)
+
+# ── Time Estimates ──────────────────────────────────────────────────────────────
+def bets_to_reach(paths, target_capital):
+    hits = []
+    for path in paths:
+        indices = np.where(path >= target_capital)[0]
+        if len(indices) > 0:
+            hits.append(int(indices[0]))
+    pct   = len(hits) / len(paths) * 100
+    median = int(np.median(hits)) if hits else None
+    return pct, median
+
+st.subheader("Time to Target")
+t1, t2, t3 = st.columns(3)
+for col, mult, label in zip([t1, t2, t3], [2, 5, 10], ["2×", "5×", "10×"]):
+    pct, med = bets_to_reach(paths, CAPITAL_0 * mult)
+    value = f"{med} bets" if med is not None else "Not reached"
+    col.metric(f"{label}  (${CAPITAL_0 * mult:,.0f})", value,
+               f"{pct:.0f}% of simulations")
 
 # ── Live Polymarket Markets ─────────────────────────────────────────────────────
 st.divider()
