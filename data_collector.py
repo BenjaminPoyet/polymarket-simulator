@@ -199,12 +199,14 @@ def main():
             time.sleep(POLL_SECONDS)
             continue
 
-        # Filter to binary markets with parseable prices
+        # Filter to binary markets with parseable prices and BTC-related questions
         binary = []
         for m in markets:
             try:
                 parse_prices(m.get("outcomePrices"))
-                binary.append(m)
+                q = (m.get("question") or "").lower()
+                if "bitcoin" in q or "btc" in q:
+                    binary.append(m)
             except (TypeError, ValueError):
                 pass
 
@@ -242,6 +244,7 @@ def main():
         elapsed = time.time() - poll_start
         print(
             f"[{ts.strftime('%H:%M:%S')}]  "
+            f"{len(binary)} BTC markets found  |  "
             f"Tracking {len(current_ids)} markets  |  "
             f"{resolved_today} resolved today  |  "
             f"poll #{poll_count}  ({elapsed:.1f}s)"
