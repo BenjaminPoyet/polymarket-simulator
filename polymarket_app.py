@@ -720,130 +720,176 @@ with tab_scan:
              "E.g. 10% → only 40%–60% Yes markets."
     ) / 100
 
-    st.caption(
-        f"Resolves within **{SCAN_HOURS_AHEAD}h**  •  "
-        f"volume > ${SCAN_MIN_VOLUME:,}  •  "
-        f"parity {50 - SCAN_PARITY_DEV*100:.0f}%–{50 + SCAN_PARITY_DEV*100:.0f}% Yes  •  "
-        f"Green = spread < {SCAN_SPREAD_LIMIT:.0%}  •  Auto-cached 5 min"
-    )
-
-    @st.cache_data(ttl=300)
-    def fetch_scanner_markets():
-        from datetime import datetime, timezone
-        now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        resp = requests.get(
-            "https://gamma-api.polymarket.com/markets",
-            params={
-                "limit":        500,
-                "active":       "true",
-                "end_date_min": now_iso,
-                "order":        "endDate",
-                "ascending":    "true",
-            },
-            timeout=15,
-        )
-        resp.raise_for_status()
-        return resp.json()
-
-    if st.button("Refresh", key="refresh_scan"):
-        fetch_scanner_markets.clear()
-
-    try:
+    @st.fragment(run_every=300)
+    def scanner_results(spread_limit, min_volume, hours_ahead, parity_dev):
         from datetime import datetime, timezone, timedelta
-        now_utc = datetime.now(timezone.utc)
-        cutoff  = now_utc + timedelta(hours=SCAN_HOURS_AHEAD)
 
-        scan_raw = fetch_scanner_markets()
-        scan_rows = []
-        for m in scan_raw:
-            prices_raw = m.get("outcomePrices")
-            try:
-                prices = json.loads(prices_raw) if isinstance(prices_raw, str) else prices_raw
-                if not prices or len(prices) != 2:
+        @st.cache_data(ttl=300)
+        def fetch_scanner_markets():
+            now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            resp = requests.get(
+                "https://gamma-api.polymarket.com/markets",
+                params={
+                    "limit":        500,
+                    "active":       "true",
+                    "end_date_min": now_iso,
+                    "order":        "endDate",
+                    "ascending":    "true",
+                },
+                timeout=15,
+            )
+            resp.raise_for_status()
+            return resp.json()
+
+        col_btn, col_ts = st.columns([1, 5])
+        if col_btn.button("Refresh now", key="refresh_scan"):
+            fetch_scanner_markets.clear()
+        col_ts.caption(
+            f"Resolves within **{hours_ahead}h**  •  "
+            f"volume > ${min_volume:,}  •  "
+            f"parity {50 - parity_dev*100:.0f}%–{50 + parity_dev*100:.0f}% Yes  •  "
+            f"spread < {spread_limit:.0%}  •  "
+            f"auto-refreshes every 5 min  •  "
+            f"last fetch: {datetime.now().strftime('%H:%M:%S')}"
+        )
+
+        try:
+            now_utc = datetime.now(timezone.utc)
+            cutoff  = now_utc + timedelta(hours=hours_ahead)
+
+            scan_raw  = fetch_scanner_markets()
+
+            # ── Filter counters ──────────────────────────────────────────────
+            n_total    = len(scan_raw)
+            n_binary   = 0   # after: has exactly 2 prices
+            n_live     = 0   # after: not resolved (no side at 100%)
+            n_window   = 0   # after: endDate within time window
+            n_volume   = 0   # after: volume >= min_volume
+            n_parity   = 0   # after: parity deviation within limit
+
+            scan_rows = []
+            for m in scan_raw:
+                prices_raw = m.get("outcomePrices")
+                try:
+                    prices = json.loads(prices_raw) if isinstance(prices_raw, str) else prices_raw
+                    if not prices or len(prices) != 2:
+                        continue
+                    yes_p = float(prices[0])
+                    no_p  = float(prices[1])
+                except (TypeError, ValueError, IndexError):
                     continue
-                yes_p = float(prices[0])
-                no_p  = float(prices[1])
-            except (TypeError, ValueError, IndexError):
-                continue
+                n_binary += 1
 
-            # Skip already-resolved markets (one side at 100%)
-            if yes_p >= 0.999 or no_p >= 0.999:
-                continue
+                if yes_p >= 0.999 or no_p >= 0.999:
+                    continue
+                n_live += 1
 
-            end_raw = m.get("end_date_iso") or m.get("endDate") or m.get("end_date") or ""
-            try:
-                end_dt = datetime.fromisoformat(end_raw.replace("Z", "+00:00"))
-            except ValueError:
-                continue
-            if end_dt <= now_utc or end_dt > cutoff:
-                continue
+                # Use endDate — full ISO timestamp with time precision
+                end_raw = m.get("endDate") or ""
+                try:
+                    end_dt = datetime.fromisoformat(end_raw.replace("Z", "+00:00"))
+                except ValueError:
+                    continue
+                if end_dt <= now_utc or end_dt > cutoff:
+                    continue
+                n_window += 1
 
-            volume = float(m.get("volume") or 0)
-            if volume < SCAN_MIN_VOLUME:
-                continue
+                volume = float(m.get("volume") or 0)
+                if volume < min_volume:
+                    continue
+                n_volume += 1
 
-            # Parity deviation: how far Yes is from 50%
-            parity_dev = abs(yes_p - 0.5)
-            if parity_dev > SCAN_PARITY_DEV:
-                continue
+                parity = abs(yes_p - 0.5)
+                if parity > parity_dev:
+                    continue
+                n_parity += 1
 
-            spread = yes_p + no_p - 1.0
+                spread   = yes_p + no_p - 1.0
+                secs_left = (end_dt - now_utc).total_seconds()
+                mins_left = int(secs_left // 60)
+                if mins_left < 60:
+                    ends_str = f"{mins_left}m"
+                elif mins_left < 1440:
+                    h, m_ = divmod(mins_left, 60)
+                    ends_str = f"{h}h {m_}m"
+                else:
+                    d, rem = divmod(mins_left, 1440)
+                    h = rem // 60
+                    ends_str = f"{d}d {h}h"
 
-            # Human-readable time until end
-            hrs_left = (end_dt - now_utc).total_seconds() / 3600
-            if hrs_left < 24:
-                ends_str = f"{hrs_left:.0f}h"
+                slug = m.get("slug", "")
+                url  = f"https://polymarket.com/event/{slug}" if slug else ""
+
+                scan_rows.append({
+                    "Market":      m.get("question", "N/A"),
+                    "Link":        url,
+                    "Yes":         yes_p,
+                    "No":          no_p,
+                    "50/50 Dist":  parity,
+                    "Spread":      spread,
+                    "Volume ($)":  volume,
+                    "Ends":        ends_str,
+                    "_flag":       spread < spread_limit,
+                })
+
+            scan_rows.sort(key=lambda x: x["Volume ($)"], reverse=True)
+
+            # ── Debug funnel ─────────────────────────────────────────────────
+            st.markdown(
+                f"**Fetch:** {n_total} &nbsp;›&nbsp; "
+                f"**Binary:** {n_binary} &nbsp;›&nbsp; "
+                f"**Not resolved:** {n_live} &nbsp;›&nbsp; "
+                f"**Within {hours_ahead}h:** {n_window} &nbsp;›&nbsp; "
+                f"**Vol ≥ ${min_volume:,}:** {n_volume} &nbsp;›&nbsp; "
+                f"**Parity ≤ {parity_dev*100:.0f}%:** {n_parity} &nbsp;›&nbsp; "
+                f"**Shown:** {len(scan_rows)}",
+                unsafe_allow_html=True,
+            )
+
+            if not scan_rows:
+                st.info("No markets match the current filters.")
             else:
-                ends_str = f"{hrs_left / 24:.1f}d"
+                df_scan    = pd.DataFrame(scan_rows)
+                flagged    = int(df_scan["_flag"].sum())
+                flag_index = set(df_scan.index[df_scan["_flag"]])
 
-            scan_rows.append({
-                "Market":      m.get("question", "N/A"),
-                "Yes":         yes_p,
-                "No":          no_p,
-                "50/50 Dist":  parity_dev,
-                "Spread":      spread,
-                "Volume ($)":  volume,
-                "Ends":        ends_str,
-                "_flag":       spread < SCAN_SPREAD_LIMIT,
-            })
+                def highlight_scan(row):
+                    if row.name in flag_index:
+                        return ["background-color: #0d2a1a; color: #3fb950"] * len(row)
+                    return [""] * len(row)
 
-        scan_rows.sort(key=lambda x: x["Volume ($)"], reverse=True)
+                display_cols = ["Market", "Link", "Yes", "No", "50/50 Dist", "Spread", "Volume ($)", "Ends"]
+                styled_scan  = (
+                    df_scan[display_cols].style
+                    .apply(highlight_scan, axis=1)
+                    .format({
+                        "Yes":        "{:.1%}",
+                        "No":         "{:.1%}",
+                        "50/50 Dist": "{:.1%}",
+                        "Spread":     "{:.2%}",
+                        "Volume ($)": "${:,.0f}",
+                    }, na_rep="N/A")
+                )
+                st.dataframe(
+                    styled_scan,
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "Link": st.column_config.LinkColumn("Link", display_text="Open"),
+                    },
+                )
+                st.caption(
+                    f"{len(scan_rows)} markets shown  •  "
+                    f"{flagged} flagged (spread < {spread_limit:.0%})"
+                )
 
-        if not scan_rows:
-            st.info("No markets match the current filters.")
-        else:
-            df_scan = pd.DataFrame(scan_rows)
-            flagged    = int(df_scan["_flag"].sum())
-            flag_index = set(df_scan.index[df_scan["_flag"]])
+        except requests.exceptions.ConnectionError:
+            st.error("Could not connect to Polymarket API.")
+        except requests.exceptions.Timeout:
+            st.error("Request timed out.")
+        except requests.exceptions.HTTPError as e:
+            st.error(f"API error: {e}")
+        except Exception as e:
+            st.error(f"Unexpected error: {e}")
 
-            def highlight_scan(row):
-                if row.name in flag_index:
-                    return ["background-color: #0d2a1a; color: #3fb950"] * len(row)
-                return [""] * len(row)
-
-            display_cols = ["Market", "Yes", "No", "50/50 Dist", "Spread", "Volume ($)", "Ends"]
-            styled_scan = (
-                df_scan[display_cols].style
-                .apply(highlight_scan, axis=1)
-                .format({
-                    "Yes":        "{:.1%}",
-                    "No":         "{:.1%}",
-                    "50/50 Dist": "{:.1%}",
-                    "Spread":     "{:.2%}",
-                    "Volume ($)": "${:,.0f}",
-                }, na_rep="N/A")
-            )
-            st.dataframe(styled_scan, use_container_width=True, hide_index=True)
-            st.caption(
-                f"{len(scan_rows)} markets shown  •  "
-                f"{flagged} flagged (spread < {SCAN_SPREAD_LIMIT:.0%})"
-            )
-
-    except requests.exceptions.ConnectionError:
-        st.error("Could not connect to Polymarket API.")
-    except requests.exceptions.Timeout:
-        st.error("Request timed out.")
-    except requests.exceptions.HTTPError as e:
-        st.error(f"API error: {e}")
-    except Exception as e:
-        st.error(f"Unexpected error: {e}")
+    scanner_results(SCAN_SPREAD_LIMIT, SCAN_MIN_VOLUME, SCAN_HOURS_AHEAD, SCAN_PARITY_DEV)
